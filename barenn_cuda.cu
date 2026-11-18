@@ -83,6 +83,27 @@ __global__ void backward_kernel(const float* grad_out, const float* z,
     }
 }
 
+// Perda e gradiente de uma amostra, calculados na GPU. Um thread por classe
+// calcula o erro; o thread 0 soma os termos na mesma ordem da CPU.
+__global__ void perda_kernel(const float* escores, const int* rotulos, int amostra,
+                             float* gradiente, float* perdas) {
+    __shared__ float termos[classes];
+    const int i = threadIdx.x;
+    if (i < classes) {
+        const float erro = escores[i] - (i == rotulos[amostra] ? 1.0f : 0.0f);
+        gradiente[i] = erro;
+        termos[i] = 0.5f * erro * erro;
+    }
+    __syncthreads();
+    if (i == 0) {
+        float total = 0;
+        for (int c = 0; c < classes; ++c) {
+            total += termos[c];
+        }
+        perdas[amostra] = total;
+    }
+}
+
 constexpr int threads_por_bloco = 64;
 
 int blocos(int n) {
@@ -163,36 +184,54 @@ int main(int argc, char** argv) {
         CamadaGPU g1 = criar(entradas, 32, false, l1->pesos(), l1->vies());
         CamadaGPU g2 = criar(32, 16, false, l2->pesos(), l2->vies());
         CamadaGPU g3 = criar(16, classes, true, l3->pesos(), l3->vies());
-        float* d_imagem;
+        // Conjunto de treino inteiro na GPU, copiado uma única vez.
+        const int n = static_cast<int>(treino.size());
+        vector<float> imagens(static_cast<size_t>(n) * entradas);
+        vector<int> rotulos(n);
+        for (int k = 0; k < n; ++k) {
+            copy(treino[k].imagem.begin(), treino[k].imagem.end(),
+                 imagens.begin() + static_cast<size_t>(k) * entradas);
+            rotulos[k] = treino[k].rotulo;
+        }
+        float* d_imagens;
+        int* d_rotulos;
         float* d_gradiente;
-        CUDA_CHECK(cudaMalloc(&d_imagem, sizeof(float) * entradas));
+        float* d_perdas;
+        CUDA_CHECK(cudaMalloc(&d_imagens, sizeof(float) * imagens.size()));
+        CUDA_CHECK(cudaMalloc(&d_rotulos, sizeof(int) * n));
         CUDA_CHECK(cudaMalloc(&d_gradiente, sizeof(float) * classes));
+        CUDA_CHECK(cudaMalloc(&d_perdas, sizeof(float) * n));
+        CUDA_CHECK(cudaMemcpy(d_imagens, imagens.data(), sizeof(float) * imagens.size(),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_rotulos, rotulos.data(), sizeof(int) * n,
+                              cudaMemcpyHostToDevice));
 
-        array<float, classes> escores{};
-        array<float, classes> gradiente{};
+        vector<float> perdas_amostra(n);
         array<double, epocas> perdas{};
 
-        // Port direto do laço da CPU: cada amostra envia a imagem, roda os
-        // kernels camada a camada, traz os escores para calcular a perda no
-        // host e devolve o gradiente para a GPU.
+        // Nenhuma cópia dentro do laço de amostras: o host só enfileira os
+        // kernels no stream e a GPU executa na ordem. A perda de cada amostra
+        // fica no device e volta uma vez por época.
         const auto inicio = chrono::steady_clock::now();
         for (int epoca = 0; epoca < epocas; ++epoca) {
-            double perda_total = 0;
-            for (const auto& amostra : treino) {
-                CUDA_CHECK(cudaMemcpy(d_imagem, amostra.imagem.data(),
-                                      sizeof(float) * entradas, cudaMemcpyHostToDevice));
-                const float* saida = forward(g3, forward(g2, forward(g1, d_imagem)));
-                CUDA_CHECK(cudaMemcpy(escores.data(), saida, sizeof(float) * classes,
-                                      cudaMemcpyDeviceToHost));
-                perda_total += Barenn::perda(escores, amostra.rotulo, &gradiente);
-                CUDA_CHECK(cudaMemcpy(d_gradiente, gradiente.data(),
-                                      sizeof(float) * classes, cudaMemcpyHostToDevice));
+            for (int k = 0; k < n; ++k) {
+                const float* x = d_imagens + static_cast<size_t>(k) * entradas;
+                const float* saida = forward(g3, forward(g2, forward(g1, x)));
+                perda_kernel<<<1, 32>>>(saida, d_rotulos, k, d_gradiente, d_perdas);
+                CUDA_CHECK(cudaGetLastError());
 
                 const float* grad3 = backward(g3, d_gradiente);
                 const float* grad2 = backward(g2, grad3);
                 backward(g1, grad2, false);
             }
-            perdas[epoca] = perda_total / treino.size();
+            // Soma em double e na ordem das amostras, como na CPU.
+            CUDA_CHECK(cudaMemcpy(perdas_amostra.data(), d_perdas, sizeof(float) * n,
+                                  cudaMemcpyDeviceToHost));
+            double perda_total = 0;
+            for (int k = 0; k < n; ++k) {
+                perda_total += perdas_amostra[k];
+            }
+            perdas[epoca] = perda_total / n;
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         const chrono::duration<double> tempo = chrono::steady_clock::now() - inicio;
@@ -204,8 +243,10 @@ int main(int argc, char** argv) {
         liberar(g1);
         liberar(g2);
         liberar(g3);
-        cudaFree(d_imagem);
+        cudaFree(d_imagens);
+        cudaFree(d_rotulos);
         cudaFree(d_gradiente);
+        cudaFree(d_perdas);
 
         Barenn::imprimir_treino(treino.size(), perdas, tempo.count());
         const auto inicio_avaliacao = chrono::steady_clock::now();
