@@ -25,8 +25,9 @@ class DenseLayer {
     int in_features;
     int out_features;
     bool final;
-    // weights[i][j] liga a entrada j ao neurônio de saída i.
-    vector<vector<float>> weights;
+    // Matriz contígua em ordem de linha: weights[i * in_features + j] liga a
+    // entrada j ao neurônio de saída i.
+    vector<float> weights;
     vector<float> bias;
     // Dados do último forward usados para calcular os gradientes.
     const vector<float>* last_input = nullptr;
@@ -39,27 +40,27 @@ class DenseLayer {
 public:
     DenseLayer(int input_size, int output_size, bool is_final = false)
         : in_features(input_size), out_features(output_size), final(is_final),
-          weights(output_size, vector<float>(input_size)), bias(output_size, 0),
+          weights(output_size * input_size), bias(output_size, 0),
           last_z(output_size), out(output_size), delta(output_size),
           grad_in(input_size) {
         // A semente fixa torna a inicialização de cada camada reproduzível.
         mt19937 gen(1337);
         uniform_real_distribution<float> distribution(-0.05f, 0.05f);
-        for (auto& row : weights) {
-            for (float& weight : row) {
-                weight = distribution(gen);
-            }
+        for (float& weight : weights) {
+            weight = distribution(gen);
         }
     }
 
     // A entrada precisa continuar viva até o Backward correspondente.
     const vector<float>& Forward(const vector<float>& input) {
         last_input = &input;
+        const float* __restrict x = input.data();
         // Cada neurônio soma o viés aos produtos entre entradas e pesos.
         for (int i = 0; i < out_features; ++i) {
+            const float* __restrict row = &weights[i * in_features];
             float sum = bias[i];
             for (int j = 0; j < in_features; ++j) {
-                sum += input[j] * weights[i][j];
+                sum += x[j] * row[j];
             }
             last_z[i] = sum;
             // As camadas ocultas usam ReLU. A última devolve escores lineares.
@@ -71,7 +72,8 @@ public:
     // A primeira camada não precisa do gradiente da entrada (calcular_grad_in = false).
     const vector<float>& Backward(const vector<float>& grad_out, float learning_rate,
                                   bool calcular_grad_in = true) {
-        const vector<float>& input = *last_input;
+        const float* __restrict x = last_input->data();
+        float* __restrict gin = grad_in.data();
         // Delta é o gradiente da perda em relação à soma antes da ativação.
         // Na ReLU, o gradiente passa apenas quando essa soma é positiva.
         for (int i = 0; i < out_features; ++i) {
@@ -80,19 +82,20 @@ public:
         }
 
         // O gradiente da entrada usa os pesos anteriores à atualização.
-        for (int i = 0; calcular_grad_in && i < in_features; ++i) {
+        for (int j = 0; calcular_grad_in && j < in_features; ++j) {
             float sum = 0;
-            for (int j = 0; j < out_features; ++j) {
-                sum += delta[j] * weights[j][i];
+            for (int i = 0; i < out_features; ++i) {
+                sum += delta[i] * weights[i * in_features + j];
             }
-            grad_in[i] = sum;
+            gin[j] = sum;
         }
 
         // SGD por amostra. O gradiente do peso é delta vezes a entrada.
         // O gradiente do viés é o próprio delta.
         for (int i = 0; i < out_features; ++i) {
+            float* __restrict row = &weights[i * in_features];
             for (int j = 0; j < in_features; ++j) {
-                weights[i][j] -= learning_rate * (delta[i] * input[j]);
+                row[j] -= learning_rate * (delta[i] * x[j]);
             }
             bias[i] -= learning_rate * delta[i];
         }
