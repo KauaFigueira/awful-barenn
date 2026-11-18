@@ -21,6 +21,12 @@ cuda: $(BIN_CUDA)
 $(BIN_CUDA): barenn_cuda.cu barenn.hpp
 	$(NVCC) $(NVCCFLAGS) $< -o $@
 
+# Mesma versão com contagem de ciclos por fase do kernel (impressa no stderr).
+perfil: $(BIN_CUDA)_perfil
+
+$(BIN_CUDA)_perfil: barenn_cuda.cu barenn.hpp
+	$(NVCC) $(NVCCFLAGS) -DBARENN_PERFIL $< -o $@
+
 run: $(BIN)
 	./$(BIN)
 
@@ -31,6 +37,6 @@ bench: $(BIN)
 	./scripts/bench.sh ./$(BIN)
 
 clean:
-	rm -f $(BIN) $(BIN_CUDA)
+	rm -f $(BIN) $(BIN_CUDA) $(BIN_CUDA)_perfil
 
-.PHONY: all cuda run validate bench clean
+.PHONY: all cuda perfil run validate bench clean
