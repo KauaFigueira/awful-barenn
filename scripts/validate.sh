@@ -13,7 +13,7 @@ OUT=$(mktemp)
 trap 'rm -f "$OUT"' EXIT
 "$BIN" > "$OUT"
 
-if diff <(grep -v 'Tempo de treino' "$REF") <(grep -v 'Tempo de treino' "$OUT") > /dev/null; then
+if diff <(grep -v -e '^Tempo' -e '^$' "$REF") <(grep -v -e '^Tempo' -e '^$' "$OUT") > /dev/null; then
     echo "OK: saida impressa identica a referencia"
     exit 0
 fi
