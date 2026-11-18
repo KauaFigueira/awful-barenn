@@ -1,5 +1,5 @@
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2
+CXXFLAGS ?= -std=c++17 -O3 -march=native -ffp-contract=off
 BIN      := barenn
 
 all: $(BIN)
