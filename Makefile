@@ -4,7 +4,7 @@ BIN      := barenn
 
 all: $(BIN)
 
-$(BIN): barenn.cpp
+$(BIN): barenn.cpp barenn.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 run: $(BIN)
