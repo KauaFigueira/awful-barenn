@@ -19,136 +19,199 @@ namespace BarennGPU {
 using Barenn::classes;
 using Barenn::entradas;
 
-// Uma camada na GPU. Os pesos usam o mesmo layout transposto da CPU:
-// w[j * out + i] liga a entrada j ao neurônio i.
-struct CamadaGPU {
-    int in, out;
-    bool final;
-    float* w;      // in * out
-    float* b;      // out
-    float* z;      // soma antes da ativação (out)
-    float* a;      // saída após a ativação (out)
-    float* grad;   // gradiente em relação à entrada (in)
-    const float* x = nullptr;  // entrada do último forward
-};
+constexpr int oculta1 = 32;
+constexpr int oculta2 = 16;
+// Um thread por entrada da maior camada.
+constexpr int threads = entradas;
 
-// Um thread por neurônio de saída: z = b + soma em j de x[j] * w[j][i].
-// A soma segue a mesma ordem da CPU.
-__global__ void forward_kernel(const float* x, const float* w, const float* b,
-                               float* z, float* a, int in, int out, bool final) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= out) {
-        return;
+// Distância entre linhas de pesos na shared memory (layout transposto da
+// CPU: w[j * Stride + i] liga a entrada j ao neurônio i).
+constexpr int stride1 = oculta1;
+constexpr int stride2 = oculta2;
+constexpr int stride3 = classes;
+
+// Um thread por neurônio: z = b + soma em j de x[j] * w[j][i], na ordem da CPU.
+template <int In, int Out, int Stride, bool Final>
+__device__ void forward_camada(const float* x, const float* w, const float* b,
+                               float* z, float* a) {
+    const int i = threadIdx.x;
+    if (i < Out) {
+        float soma = b[i];
+        #pragma unroll
+        for (int j = 0; j < In; ++j) {
+            soma += x[j] * w[j * Stride + i];
+        }
+        z[i] = soma;
+        // Mesmo critério de std::max(0.0f, soma).
+        a[i] = Final ? soma : (0.0f < soma ? soma : 0.0f);
     }
-    float soma = b[i];
-    for (int j = 0; j < in; ++j) {
-        soma += x[j] * w[j * out + i];
-    }
-    z[i] = soma;
-    // Mesmo critério de std::max(0.0f, soma).
-    a[i] = final ? soma : (0.0f < soma ? soma : 0.0f);
 }
 
 // Um thread por entrada j: calcula grad_in[j] com os pesos antigos da linha j
-// e depois aplica o SGD nessa linha. Cada thread só escreve na própria linha,
-// então não há condição de corrida. Os threads j < out atualizam o viés.
-__global__ void backward_kernel(const float* grad_out, const float* z,
-                                const float* x, float* w, float* b,
-                                float* grad_in, int in, int out, bool final,
-                                bool calcular_grad_in, float taxa) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= in) {
-        return;
-    }
-    float* linha = w + j * out;
-    if (calcular_grad_in) {
-        float soma = 0;
-        for (int i = 0; i < out; ++i) {
-            const float d = final ? grad_out[i]
-                                  : grad_out[i] * (z[i] > 0.0f ? 1.0f : 0.0f);
-            soma += d * linha[i];
+// e já devolve o delta da camada anterior (grad_in * ReLU'(z_anterior)).
+// Depois aplica o SGD na própria linha; threads j < Out atualizam o viés.
+template <int In, int Out, int Stride, bool CalcularGradIn>
+__device__ void backward_camada(const float* delta, const float* x, float* w,
+                                float* b, const float* z_anterior,
+                                float* delta_anterior, float taxa) {
+    const int j = threadIdx.x;
+    if (j < In) {
+        float* linha = w + j * Stride;
+        if (CalcularGradIn) {
+            float soma = 0;
+            #pragma unroll
+            for (int i = 0; i < Out; ++i) {
+                soma += delta[i] * linha[i];
+            }
+            delta_anterior[j] = soma * (z_anterior[j] > 0.0f ? 1.0f : 0.0f);
         }
-        grad_in[j] = soma;
+        const float xj = x[j];
+        #pragma unroll
+        for (int i = 0; i < Out; ++i) {
+            linha[i] -= taxa * (delta[i] * xj);
+        }
     }
-    const float xj = x[j];
-    for (int i = 0; i < out; ++i) {
-        const float d = final ? grad_out[i]
-                              : grad_out[i] * (z[i] > 0.0f ? 1.0f : 0.0f);
-        linha[i] -= taxa * (d * xj);
-    }
-    if (j < out) {
-        const float d = final ? grad_out[j]
-                              : grad_out[j] * (z[j] > 0.0f ? 1.0f : 0.0f);
-        b[j] -= taxa * d;
+    if (j < Out) {
+        b[j] -= taxa * delta[j];
     }
 }
 
-// Perda e gradiente de uma amostra, calculados na GPU. Um thread por classe
-// calcula o erro; o thread 0 soma os termos na mesma ordem da CPU.
-__global__ void perda_kernel(const float* escores, const int* rotulos, int amostra,
-                             float* gradiente, float* perdas) {
+// Copia uma matriz [In][Out] contígua da memória global para a shared
+// memory com distância Stride entre linhas (e de volta, se Ida = false).
+template <int In, int Out, int Stride, bool Ida>
+__device__ void copiar_pesos(float* global, float* shared) {
+    for (int k = threadIdx.x; k < In * Out; k += blockDim.x) {
+        const int j = k / Out;
+        const int i = k % Out;
+        if (Ida) {
+            shared[j * Stride + i] = global[k];
+        } else {
+            global[k] = shared[j * Stride + i];
+        }
+    }
+}
+
+// Com -DBARENN_PERFIL, o thread 0 acumula os ciclos (clock64) gastos em cada
+// fase do treino. Como cada fase termina num __syncthreads(), o tempo medido
+// pelo thread 0 é o tempo da fase para o bloco inteiro.
+constexpr int fases = 8;
+#ifdef BARENN_PERFIL
+#define MARCA(fase)                                                            \
+    if (t == 0) {                                                              \
+        const long long agora = clock64();                                     \
+        ciclos[fase] += agora - antes;                                         \
+        antes = agora;                                                         \
+    }
+#else
+#define MARCA(fase)
+#endif
+
+struct Parametros {
+    float* w1; float* b1;
+    float* w2; float* b2;
+    float* w3; float* b3;
+};
+
+// Treino inteiro em um único lançamento de 1 bloco. Toda a rede fica na
+// shared memory; as fases de cada amostra são separadas por __syncthreads().
+__global__ void __launch_bounds__(threads, 1)
+treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
+               int epocas, float taxa, float* perdas, long long* perfil) {
+    __shared__ float w1[entradas * stride1], b1[oculta1];
+    __shared__ float w2[oculta1 * stride2], b2[oculta2];
+    __shared__ float w3[oculta2 * stride3], b3[classes];
+    __shared__ float x[entradas];
+    __shared__ float z1[oculta1], a1[oculta1], delta1[oculta1];
+    __shared__ float z2[oculta2], a2[oculta2], delta2[oculta2];
+    __shared__ float z3[classes], a3[classes], delta3[classes];
     __shared__ float termos[classes];
-    const int i = threadIdx.x;
-    if (i < classes) {
-        const float erro = escores[i] - (i == rotulos[amostra] ? 1.0f : 0.0f);
-        gradiente[i] = erro;
-        termos[i] = 0.5f * erro * erro;
-    }
+
+    const int t = threadIdx.x;
+    copiar_pesos<entradas, oculta1, stride1, true>(p.w1, w1);
+    copiar_pesos<oculta1, oculta2, stride2, true>(p.w2, w2);
+    copiar_pesos<oculta2, classes, stride3, true>(p.w3, w3);
+    if (t < oculta1) b1[t] = p.b1[t];
+    if (t < oculta2) b2[t] = p.b2[t];
+    if (t < classes) b3[t] = p.b3[t];
     __syncthreads();
-    if (i == 0) {
-        float total = 0;
-        for (int c = 0; c < classes; ++c) {
-            total += termos[c];
+
+#ifdef BARENN_PERFIL
+    long long ciclos[fases] = {};
+    long long antes = clock64();
+#endif
+    for (int epoca = 0; epoca < epocas; ++epoca) {
+        for (int k = 0; k < n; ++k) {
+            x[t] = imagens[static_cast<size_t>(k) * entradas + t];
+            __syncthreads();
+            MARCA(0)
+
+            forward_camada<entradas, oculta1, stride1, false>(x, w1, b1, z1, a1);
+            __syncthreads();
+            MARCA(1)
+            forward_camada<oculta1, oculta2, stride2, false>(a1, w2, b2, z2, a2);
+            __syncthreads();
+            MARCA(2)
+            forward_camada<oculta2, classes, stride3, true>(a2, w3, b3, z3, a3);
+            __syncthreads();
+            MARCA(3)
+
+            // Perda: o erro de cada classe é o próprio delta da última camada.
+            if (t < classes) {
+                const float erro = a3[t] - (t == rotulos[k] ? 1.0f : 0.0f);
+                delta3[t] = erro;
+                termos[t] = 0.5f * erro * erro;
+            }
+            __syncthreads();
+            MARCA(4)
+            // O thread 0 soma na mesma ordem da CPU; ninguém mais usa termos
+            // até a próxima amostra.
+            if (t == 0) {
+                float total = 0;
+                for (int c = 0; c < classes; ++c) {
+                    total += termos[c];
+                }
+                perdas[static_cast<size_t>(epoca) * n + k] = total;
+            }
+
+            backward_camada<oculta2, classes, stride3, true>(delta3, a2, w3, b3, z2, delta2, taxa);
+            __syncthreads();
+            MARCA(5)
+            backward_camada<oculta1, oculta2, stride2, true>(delta2, a1, w2, b2, z1, delta1, taxa);
+            __syncthreads();
+            MARCA(6)
+            backward_camada<entradas, oculta1, stride1, false>(delta1, x, w1, b1, nullptr, nullptr, taxa);
+            __syncthreads();
+            MARCA(7)
         }
-        perdas[amostra] = total;
     }
+
+#ifdef BARENN_PERFIL
+    if (t == 0) {
+        for (int f = 0; f < fases; ++f) {
+            perfil[f] = ciclos[f];
+        }
+    }
+#endif
+    copiar_pesos<entradas, oculta1, stride1, false>(p.w1, w1);
+    copiar_pesos<oculta1, oculta2, stride2, false>(p.w2, w2);
+    copiar_pesos<oculta2, classes, stride3, false>(p.w3, w3);
+    if (t < oculta1) p.b1[t] = b1[t];
+    if (t < oculta2) p.b2[t] = b2[t];
+    if (t < classes) p.b3[t] = b3[t];
 }
 
-constexpr int threads_por_bloco = 64;
-
-int blocos(int n) {
-    return (n + threads_por_bloco - 1) / threads_por_bloco;
+// Reserva um vetor na GPU e copia o conteúdo do host.
+template <typename T>
+T* enviar(const T* dados, size_t n) {
+    T* ptr;
+    CUDA_CHECK(cudaMalloc(&ptr, sizeof(T) * n));
+    CUDA_CHECK(cudaMemcpy(ptr, dados, sizeof(T) * n, cudaMemcpyHostToDevice));
+    return ptr;
 }
 
-CamadaGPU criar(int in, int out, bool final, const float* w_host, const float* b_host) {
-    CamadaGPU c{in, out, final, nullptr, nullptr, nullptr, nullptr, nullptr};
-    CUDA_CHECK(cudaMalloc(&c.w, sizeof(float) * in * out));
-    CUDA_CHECK(cudaMalloc(&c.b, sizeof(float) * out));
-    CUDA_CHECK(cudaMalloc(&c.z, sizeof(float) * out));
-    CUDA_CHECK(cudaMalloc(&c.a, sizeof(float) * out));
-    CUDA_CHECK(cudaMalloc(&c.grad, sizeof(float) * in));
-    CUDA_CHECK(cudaMemcpy(c.w, w_host, sizeof(float) * in * out, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(c.b, b_host, sizeof(float) * out, cudaMemcpyHostToDevice));
-    return c;
-}
-
-void baixar(const CamadaGPU& c, float* w_host, float* b_host) {
-    CUDA_CHECK(cudaMemcpy(w_host, c.w, sizeof(float) * c.in * c.out, cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(b_host, c.b, sizeof(float) * c.out, cudaMemcpyDeviceToHost));
-}
-
-void liberar(CamadaGPU& c) {
-    cudaFree(c.w);
-    cudaFree(c.b);
-    cudaFree(c.z);
-    cudaFree(c.a);
-    cudaFree(c.grad);
-}
-
-const float* forward(CamadaGPU& c, const float* x) {
-    c.x = x;
-    forward_kernel<<<blocos(c.out), threads_por_bloco>>>(x, c.w, c.b, c.z, c.a,
-                                                         c.in, c.out, c.final);
-    CUDA_CHECK(cudaGetLastError());
-    return c.a;
-}
-
-const float* backward(CamadaGPU& c, const float* grad_out, bool calcular_grad_in = true) {
-    backward_kernel<<<blocos(c.in), threads_por_bloco>>>(
-        grad_out, c.z, c.x, c.w, c.b, c.grad, c.in, c.out, c.final,
-        calcular_grad_in, Barenn::taxa);
-    CUDA_CHECK(cudaGetLastError());
-    return c.grad;
+template <typename T>
+void receber(T* destino, const T* ptr, size_t n) {
+    CUDA_CHECK(cudaMemcpy(destino, ptr, sizeof(T) * n, cudaMemcpyDeviceToHost));
 }
 
 } // namespace BarennGPU
@@ -181,9 +244,11 @@ int main(int argc, char** argv) {
 
         // Inicializa o contexto CUDA fora da medição do treino.
         CUDA_CHECK(cudaFree(nullptr));
-        CamadaGPU g1 = criar(entradas, 32, false, l1->pesos(), l1->vies());
-        CamadaGPU g2 = criar(32, 16, false, l2->pesos(), l2->vies());
-        CamadaGPU g3 = criar(16, classes, true, l3->pesos(), l3->vies());
+        Parametros p{
+            enviar(l1->pesos(), entradas * oculta1), enviar(l1->vies(), oculta1),
+            enviar(l2->pesos(), oculta1 * oculta2), enviar(l2->vies(), oculta2),
+            enviar(l3->pesos(), oculta2 * classes), enviar(l3->vies(), classes)};
+
         // Conjunto de treino inteiro na GPU, copiado uma única vez.
         const int n = static_cast<int>(treino.size());
         vector<float> imagens(static_cast<size_t>(n) * entradas);
@@ -193,60 +258,67 @@ int main(int argc, char** argv) {
                  imagens.begin() + static_cast<size_t>(k) * entradas);
             rotulos[k] = treino[k].rotulo;
         }
-        float* d_imagens;
-        int* d_rotulos;
-        float* d_gradiente;
+        float* d_imagens = enviar(imagens.data(), imagens.size());
+        int* d_rotulos = enviar(rotulos.data(), rotulos.size());
         float* d_perdas;
-        CUDA_CHECK(cudaMalloc(&d_imagens, sizeof(float) * imagens.size()));
-        CUDA_CHECK(cudaMalloc(&d_rotulos, sizeof(int) * n));
-        CUDA_CHECK(cudaMalloc(&d_gradiente, sizeof(float) * classes));
-        CUDA_CHECK(cudaMalloc(&d_perdas, sizeof(float) * n));
-        CUDA_CHECK(cudaMemcpy(d_imagens, imagens.data(), sizeof(float) * imagens.size(),
-                              cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_rotulos, rotulos.data(), sizeof(int) * n,
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_perdas, sizeof(float) * epocas * n));
+        long long* d_perfil;
+        CUDA_CHECK(cudaMalloc(&d_perfil, sizeof(long long) * fases));
+        CUDA_CHECK(cudaMemset(d_perfil, 0, sizeof(long long) * fases));
 
-        vector<float> perdas_amostra(n);
-        array<double, epocas> perdas{};
-
-        // Nenhuma cópia dentro do laço de amostras: o host só enfileira os
-        // kernels no stream e a GPU executa na ordem. A perda de cada amostra
-        // fica no device e volta uma vez por época.
+        // Um único lançamento treina todas as épocas.
         const auto inicio = chrono::steady_clock::now();
-        for (int epoca = 0; epoca < epocas; ++epoca) {
-            for (int k = 0; k < n; ++k) {
-                const float* x = d_imagens + static_cast<size_t>(k) * entradas;
-                const float* saida = forward(g3, forward(g2, forward(g1, x)));
-                perda_kernel<<<1, 32>>>(saida, d_rotulos, k, d_gradiente, d_perdas);
-                CUDA_CHECK(cudaGetLastError());
-
-                const float* grad3 = backward(g3, d_gradiente);
-                const float* grad2 = backward(g2, grad3);
-                backward(g1, grad2, false);
-            }
-            // Soma em double e na ordem das amostras, como na CPU.
-            CUDA_CHECK(cudaMemcpy(perdas_amostra.data(), d_perdas, sizeof(float) * n,
-                                  cudaMemcpyDeviceToHost));
-            double perda_total = 0;
-            for (int k = 0; k < n; ++k) {
-                perda_total += perdas_amostra[k];
-            }
-            perdas[epoca] = perda_total / n;
-        }
+        treinar_kernel<<<1, threads>>>(p, d_imagens, d_rotulos, n, epocas,
+                                       Barenn::taxa, d_perdas, d_perfil);
+        CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         const chrono::duration<double> tempo = chrono::steady_clock::now() - inicio;
 
+#ifdef BARENN_PERFIL
+        // Ciclos por amostra em cada fase (stderr, para não alterar a saída).
+        array<long long, fases> perfil{};
+        receber(perfil.data(), d_perfil, fases);
+        const char* nomes[fases] = {"carga x", "forward 1", "forward 2", "forward 3",
+                                    "perda", "backward 3", "backward 2", "backward 1"};
+        long long total_ciclos = 0;
+        for (long long c : perfil) {
+            total_ciclos += c;
+        }
+        const double amostras = static_cast<double>(epocas) * n;
+        cerr << fixed << setprecision(1) << "PERFIL (ciclos por amostra)\n";
+        for (int f = 0; f < fases; ++f) {
+            cerr << setw(12) << nomes[f] << " " << setw(8) << perfil[f] / amostras
+                 << "  " << setw(5) << 100.0 * perfil[f] / total_ciclos << " %\n";
+        }
+        cerr << setw(12) << "total" << " " << setw(8) << total_ciclos / amostras
+             << "  clock efetivo " << setprecision(0)
+             << total_ciclos / tempo.count() / 1e6 << " MHz\n";
+#endif
+        cudaFree(d_perfil);
+
+        // Soma as perdas em double e na ordem das amostras, como na CPU.
+        vector<float> perdas_amostra(static_cast<size_t>(epocas) * n);
+        receber(perdas_amostra.data(), d_perdas, perdas_amostra.size());
+        array<double, epocas> perdas{};
+        for (int epoca = 0; epoca < epocas; ++epoca) {
+            double perda_total = 0;
+            for (int k = 0; k < n; ++k) {
+                perda_total += perdas_amostra[static_cast<size_t>(epoca) * n + k];
+            }
+            perdas[epoca] = perda_total / n;
+        }
+
         // Traz os pesos treinados de volta e avalia com o código da CPU.
-        baixar(g1, l1->pesos(), l1->vies());
-        baixar(g2, l2->pesos(), l2->vies());
-        baixar(g3, l3->pesos(), l3->vies());
-        liberar(g1);
-        liberar(g2);
-        liberar(g3);
-        cudaFree(d_imagens);
+        receber(l1->pesos(), p.w1, entradas * oculta1);
+        receber(l1->vies(), p.b1, oculta1);
+        receber(l2->pesos(), p.w2, oculta1 * oculta2);
+        receber(l2->vies(), p.b2, oculta2);
+        receber(l3->pesos(), p.w3, oculta2 * classes);
+        receber(l3->vies(), p.b3, classes);
+        for (float* ptr : {p.w1, p.b1, p.w2, p.b2, p.w3, p.b3, d_imagens, d_perdas}) {
+            cudaFree(ptr);
+        }
         cudaFree(d_rotulos);
-        cudaFree(d_gradiente);
-        cudaFree(d_perdas);
 
         Barenn::imprimir_treino(treino.size(), perdas, tempo.count());
         const auto inicio_avaliacao = chrono::steady_clock::now();
