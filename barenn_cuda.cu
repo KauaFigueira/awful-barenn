@@ -25,10 +25,12 @@ constexpr int oculta2 = 16;
 constexpr int threads = entradas;
 
 // Distância entre linhas de pesos na shared memory (layout transposto da
-// CPU: w[j * Stride + i] liga a entrada j ao neurônio i).
-constexpr int stride1 = oculta1;
-constexpr int stride2 = oculta2;
-constexpr int stride3 = classes;
+// CPU: w[j * Stride + i] liga a entrada j ao neurônio i). O stride ímpar
+// (padding de uma palavra) faz os threads do backward, que percorrem linhas
+// diferentes, caírem em bancos diferentes da shared memory.
+constexpr int stride1 = oculta1 + 1;
+constexpr int stride2 = oculta2 + 1;
+constexpr int stride3 = classes + 1;
 
 // Um thread por neurônio: z = b + soma em j de x[j] * w[j][i], na ordem da CPU.
 template <int In, int Out, int Stride, bool Final>
