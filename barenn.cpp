@@ -123,42 +123,59 @@ struct Amostra {
     int rotulo;
 };
 
+// Converte uma linha do arquivo. Devolve false se o formato for inválido.
+bool ler_linha(const string& linha, Amostra& amostra) {
+    istringstream campos(linha);
+    amostra.imagem.clear();
+    amostra.imagem.reserve(entradas);
+    // Cada atributo deve ser seguido por vírgula, inclusive o último.
+    for (int i = 0; i < entradas; ++i) {
+        float valor;
+        char separador;
+        if (!(campos >> valor >> separador) || separador != ',' ||
+            !isfinite(valor) || valor < 0 || valor > 16) {
+            break;
+        }
+        // Converte os valores de [0, 16] para [0, 1].
+        amostra.imagem.push_back(valor / 16.0f);
+    }
+    // Depois dos atributos, deve restar apenas o rótulo de 0 a 9.
+    return amostra.imagem.size() == entradas &&
+           (campos >> amostra.rotulo) &&
+           amostra.rotulo >= 0 && amostra.rotulo < classes &&
+           (campos >> ws).eof();
+}
+
 vector<Amostra> ler_dados(const string& caminho) {
     ifstream arquivo(caminho);
     if (!arquivo) {
         throw runtime_error("Não foi possível abrir " + caminho);
     }
 
-    vector<Amostra> dados;
+    // A leitura do disco é sequencial; a conversão de cada linha é
+    // independente e roda em paralelo.
+    vector<string> linhas;
     string linha;
-    size_t numero_linha = 0;
     while (getline(arquivo, linha)) {
-        ++numero_linha;
-        istringstream campos(linha);
-        Amostra amostra{};
-        // Cada atributo deve ser seguido por vírgula, inclusive o último.
-        for (int i = 0; i < entradas; ++i) {
-            float valor;
-            char separador;
-            if (!(campos >> valor >> separador) || separador != ',' ||
-                !isfinite(valor) || valor < 0 || valor > 16) {
-                break;
-            }
-            // Converte os valores de [0, 16] para [0, 1].
-            amostra.imagem.push_back(valor / 16.0f);
-        }
-        // Depois dos atributos, deve restar apenas o rótulo de 0 a 9.
-        if (amostra.imagem.size() != entradas ||
-            !(campos >> amostra.rotulo) ||
-            amostra.rotulo < 0 || amostra.rotulo >= classes ||
-            !(campos >> ws).eof()) {
-            throw runtime_error(caminho + ":" + to_string(numero_linha) +
-                " — esperados 64 atributos de 0 a 16 e um rótulo inteiro de 0 a 9");
-        }
-        dados.push_back(move(amostra));
+        linhas.push_back(move(linha));
     }
-    if (arquivo.bad() || dados.empty()) {
+    if (arquivo.bad() || linhas.empty()) {
         throw runtime_error("Falha de leitura ou arquivo vazio: " + caminho);
+    }
+
+    const long n = static_cast<long>(linhas.size());
+    vector<Amostra> dados(n);
+    // Guarda a primeira linha inválida para reportar o mesmo erro da versão serial.
+    long primeira_invalida = n;
+    #pragma omp parallel for schedule(static) reduction(min : primeira_invalida)
+    for (long i = 0; i < n; ++i) {
+        if (!ler_linha(linhas[i], dados[i])) {
+            primeira_invalida = min(primeira_invalida, i);
+        }
+    }
+    if (primeira_invalida < n) {
+        throw runtime_error(caminho + ":" + to_string(primeira_invalida + 1) +
+            " — esperados 64 atributos de 0 a 16 e um rótulo inteiro de 0 a 9");
     }
     return dados;
 }
@@ -282,11 +299,14 @@ int main(int argc, char** argv) {
     const string arquivo_teste = argc == 3 ? argv[2] : "optdigits.tes";
 
     try {
+        const auto inicio_total = chrono::steady_clock::now();
         const auto treino = Barenn::ler_dados(arquivo_treino);
         const auto teste = Barenn::ler_dados(arquivo_teste);
         if (filesystem::equivalent(arquivo_treino, arquivo_teste)) {
             throw runtime_error("Use arquivos distintos para treino e teste.");
         }
+        const chrono::duration<double> tempo_leitura =
+            chrono::steady_clock::now() - inicio_total;
 
         constexpr int epocas = 51;
         constexpr float taxa = 0.02f;
@@ -325,7 +345,17 @@ int main(int argc, char** argv) {
                  << " | perda media " << perdas[epoca] << "\n";
         }
         cout << "Tempo de treino " << tempo.count() << " s\n";
+        const auto inicio_avaliacao = chrono::steady_clock::now();
         Barenn::avaliar(*l1, *l2, *l3, teste);
+        const auto fim = chrono::steady_clock::now();
+        const chrono::duration<double> tempo_avaliacao = fim - inicio_avaliacao;
+        const chrono::duration<double> tempo_total = fim - inicio_total;
+
+        // Tempos das outras etapas, para enxergar o que não é treino.
+        cout << fixed << setprecision(4)
+             << "\nTempo de leitura " << tempo_leitura.count() << " s\n"
+             << "Tempo de avaliacao " << tempo_avaliacao.count() << " s\n"
+             << "Tempo total " << tempo_total.count() << " s\n";
     } catch (const exception& erro) {
         cerr << "Erro: " << erro.what() << "\n";
         return 1;
