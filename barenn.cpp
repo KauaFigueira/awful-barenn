@@ -81,23 +81,26 @@ public:
                              : grad_out[i] * (last_z[i] > 0.0f ? 1.0f : 0.0f);
         }
 
-        // O gradiente da entrada usa os pesos anteriores à atualização.
-        for (int j = 0; calcular_grad_in && j < in_features; ++j) {
-            float sum = 0;
-            for (int i = 0; i < out_features; ++i) {
-                sum += delta[i] * weights[i * in_features + j];
-            }
-            gin[j] = sum;
+        // Uma única passada por linha: primeiro acumula a contribuição da linha
+        // no gradiente da entrada (com o peso antigo), depois aplica o SGD.
+        // grad_in[j] = soma em i de delta[i] * w[i][j], na mesma ordem do legado.
+        if (calcular_grad_in) {
+            fill(grad_in.begin(), grad_in.end(), 0.0f);
         }
-
-        // SGD por amostra. O gradiente do peso é delta vezes a entrada.
-        // O gradiente do viés é o próprio delta.
         for (int i = 0; i < out_features; ++i) {
             float* __restrict row = &weights[i * in_features];
-            for (int j = 0; j < in_features; ++j) {
-                row[j] -= learning_rate * (delta[i] * x[j]);
+            const float d = delta[i];
+            if (calcular_grad_in) {
+                for (int j = 0; j < in_features; ++j) {
+                    gin[j] += d * row[j];
+                }
             }
-            bias[i] -= learning_rate * delta[i];
+            // SGD por amostra. O gradiente do peso é delta vezes a entrada.
+            // O gradiente do viés é o próprio delta.
+            for (int j = 0; j < in_features; ++j) {
+                row[j] -= learning_rate * (d * x[j]);
+            }
+            bias[i] -= learning_rate * d;
         }
         return grad_in;
     }
