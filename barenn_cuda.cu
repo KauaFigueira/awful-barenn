@@ -28,7 +28,8 @@ constexpr int oculta2 = 16;
 #define BARENN_THREADS 256
 #endif
 constexpr int threads = BARENN_THREADS;
-static_assert(threads >= entradas && threads % 32 == 0, "bloco pequeno demais");
+static_assert(threads > 2 * 32 && threads >= entradas && threads % 32 == 0,
+              "bloco pequeno demais");
 
 // Distância entre linhas de pesos na shared memory (layout transposto da
 // CPU: w[j * Stride + i] liga a entrada j ao neurônio i). O stride ímpar
@@ -120,7 +121,7 @@ __device__ void copiar_pesos(float* global, float* shared) {
 // Com -DBARENN_PERFIL, o thread 0 acumula os ciclos (clock64) gastos em cada
 // fase do treino. Como cada fase termina num __syncthreads(), o tempo medido
 // pelo thread 0 é o tempo da fase para o bloco inteiro.
-constexpr int fases = 8;
+constexpr int fases = 6;
 #ifdef BARENN_PERFIL
 #define MARCA(fase)                                                            \
     if (t == 0) {                                                              \
@@ -146,7 +147,9 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
     __shared__ float w1[entradas * stride1], b1[oculta1];
     __shared__ float w2[oculta1 * stride2], b2[oculta2];
     __shared__ float w3[oculta2 * stride3], b3[classes];
-    __shared__ float x[entradas];
+    // Duas cópias de x: enquanto a amostra atual usa uma, a próxima é
+    // escrita na outra durante a fase de update.
+    __shared__ float x[2][entradas];
     __shared__ float z1[oculta1], a1[oculta1], delta1[oculta1];
     __shared__ float z2[oculta2], a2[oculta2], delta2[oculta2];
     __shared__ float z3[classes], a3[classes], delta3[classes];
@@ -159,41 +162,47 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
     if (t < oculta1) b1[t] = p.b1[t];
     if (t < oculta2) b2[t] = p.b2[t];
     if (t < classes) b3[t] = p.b3[t];
+    if (t < entradas) x[0][t] = imagens[t];
+    // Rótulo da amostra atual, mantido em registrador pelos threads da perda.
+    int rotulo = rotulos[0];
     __syncthreads();
 
 #ifdef BARENN_PERFIL
     long long ciclos[fases] = {};
     long long antes = clock64();
 #endif
+    int atual = 0;
     for (int epoca = 0; epoca < epocas; ++epoca) {
         for (int k = 0; k < n; ++k) {
-            if (t < entradas) {
-                x[t] = imagens[static_cast<size_t>(k) * entradas + t];
-            }
+            const float* xa = x[atual];
+            // Prefetch: a leitura da próxima amostra (memória global, ~300
+            // ciclos) é disparada agora e só é usada no fim da amostra, então
+            // a latência fica escondida atrás das fases de cálculo.
+            const int seguinte = k + 1 < n ? k + 1 : 0;
+            const float x_seguinte =
+                t < entradas ? imagens[static_cast<size_t>(seguinte) * entradas + t] : 0.0f;
+            const int rotulo_seguinte = rotulos[seguinte];
+
+            forward_camada<entradas, oculta1, stride1, false>(xa, w1, b1, z1, a1);
             __syncthreads();
             MARCA(0)
-
-            forward_camada<entradas, oculta1, stride1, false>(x, w1, b1, z1, a1);
-            __syncthreads();
-            MARCA(1)
             forward_camada<oculta1, oculta2, stride2, false>(a1, w2, b2, z2, a2);
             __syncthreads();
-            MARCA(2)
+            MARCA(1)
+            // Forward 3 e perda na mesma fase: o thread t usa só o a3[t] que
+            // ele mesmo acabou de calcular. O erro de cada classe é o delta da
+            // última camada.
             forward_camada<oculta2, classes, stride3, true>(a2, w3, b3, z3, a3);
-            __syncthreads();
-            MARCA(3)
-
-            // Perda: o erro de cada classe é o próprio delta da última camada.
             if (t < classes) {
-                const float erro = a3[t] - (t == rotulos[k] ? 1.0f : 0.0f);
+                const float erro = a3[t] - (t == rotulo ? 1.0f : 0.0f);
                 delta3[t] = erro;
                 termos[t] = 0.5f * erro * erro;
             }
             __syncthreads();
-            MARCA(4)
-            // O thread 0 soma na mesma ordem da CPU; ninguém mais usa termos
-            // até a próxima amostra.
-            if (t == 0) {
+            MARCA(2)
+            // Um thread que não participa do grad_in 3 soma a perda, na mesma
+            // ordem da CPU; ninguém mais usa termos até a próxima amostra.
+            if (t == 2 * 32) {
                 float total = 0;
                 for (int c = 0; c < classes; ++c) {
                     total += termos[c];
@@ -206,15 +215,20 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
             // os três podem rodar na mesma fase.
             gradiente_entrada<oculta2, classes, stride3>(delta3, w3, z2, delta2);
             __syncthreads();
-            MARCA(5)
+            MARCA(3)
             gradiente_entrada<oculta1, oculta2, stride2>(delta2, w2, z1, delta1);
             __syncthreads();
-            MARCA(6)
+            MARCA(4)
             atualizar_pesos<oculta2, classes, stride3>(delta3, a2, w3, b3, taxa);
             atualizar_pesos<oculta1, oculta2, stride2>(delta2, a1, w2, b2, taxa);
-            atualizar_pesos<entradas, oculta1, stride1>(delta1, x, w1, b1, taxa);
+            atualizar_pesos<entradas, oculta1, stride1>(delta1, xa, w1, b1, taxa);
+            if (t < entradas) {
+                x[atual ^ 1][t] = x_seguinte;
+            }
+            rotulo = rotulo_seguinte;
+            atual ^= 1;
             __syncthreads();
-            MARCA(7)
+            MARCA(5)
         }
     }
 
@@ -311,8 +325,8 @@ int main(int argc, char** argv) {
         // Ciclos por amostra em cada fase (stderr, para não alterar a saída).
         array<long long, fases> perfil{};
         receber(perfil.data(), d_perfil, fases);
-        const char* nomes[fases] = {"carga x", "forward 1", "forward 2", "forward 3",
-                                    "perda", "grad_in 3", "grad_in 2", "updates"};
+        const char* nomes[fases] = {"forward 1", "forward 2", "fwd 3+perda",
+                                    "grad_in 3", "grad_in 2", "updates"};
         long long total_ciclos = 0;
         for (long long c : perfil) {
             total_ciclos += c;
