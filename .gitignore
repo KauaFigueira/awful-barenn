@@ -1,0 +1,9 @@
+barenn
+barenn_cuda
+*.o
+callgrind.out.*
+!callgrind.out.45358
+cachegrind.out.*
+*.nsys-rep
+*.ncu-rep
+*.sqlite
