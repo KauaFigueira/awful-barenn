@@ -21,8 +21,14 @@ using Barenn::entradas;
 
 constexpr int oculta1 = 32;
 constexpr int oculta2 = 16;
-// Um thread por entrada da maior camada.
-constexpr int threads = entradas;
+// Threads do bloco. Forward e grad_in usam um thread por neurônio/entrada
+// (no máximo 64); o update dos pesos é distribuído entre todos os threads,
+// o que dá mais warps para esconder a latência da shared memory.
+#ifndef BARENN_THREADS
+#define BARENN_THREADS 256
+#endif
+constexpr int threads = BARENN_THREADS;
+static_assert(threads >= entradas && threads % 32 == 0, "bloco pequeno demais");
 
 // Distância entre linhas de pesos na shared memory (layout transposto da
 // CPU: w[j * Stride + i] liga a entrada j ao neurônio i). O stride ímpar
@@ -50,31 +56,49 @@ __device__ void forward_camada(const float* x, const float* w, const float* b,
 }
 
 // Um thread por entrada j: calcula grad_in[j] com os pesos antigos da linha j
-// e já devolve o delta da camada anterior (grad_in * ReLU'(z_anterior)).
-// Depois aplica o SGD na própria linha; threads j < Out atualizam o viés.
-template <int In, int Out, int Stride, bool CalcularGradIn>
-__device__ void backward_camada(const float* delta, const float* x, float* w,
-                                float* b, const float* z_anterior,
-                                float* delta_anterior, float taxa) {
+// e devolve o delta da camada anterior (grad_in * ReLU'(z_anterior)).
+// Precisa terminar (barreira) antes do update, que mexe em todas as linhas.
+template <int In, int Out, int Stride>
+__device__ void gradiente_entrada(const float* delta, const float* w,
+                                  const float* z_anterior, float* delta_anterior) {
     const int j = threadIdx.x;
     if (j < In) {
-        float* linha = w + j * Stride;
-        if (CalcularGradIn) {
-            float soma = 0;
-            #pragma unroll
-            for (int i = 0; i < Out; ++i) {
-                soma += delta[i] * linha[i];
-            }
-            delta_anterior[j] = soma * (z_anterior[j] > 0.0f ? 1.0f : 0.0f);
-        }
-        const float xj = x[j];
+        const float* linha = w + j * Stride;
+        float soma = 0;
         #pragma unroll
         for (int i = 0; i < Out; ++i) {
-            linha[i] -= taxa * (delta[i] * xj);
+            soma += delta[i] * linha[i];
+        }
+        delta_anterior[j] = soma * (z_anterior[j] > 0.0f ? 1.0f : 0.0f);
+    }
+}
+
+// SGD distribuído: o peso (j, i) fica com o thread k = j * Out + i (mod
+// blockDim). Threads vizinhos pegam colunas vizinhas da mesma linha, então
+// não há conflito de banco; x[j] é broadcast.
+template <int In, int Out, int Stride>
+__device__ void atualizar_pesos(const float* delta, const float* x, float* w,
+                                float* b, float taxa) {
+    const int t = threadIdx.x;
+    if constexpr (threads % Out == 0) {
+        // A coluna i de cada thread é fixa: delta[i] fica num registrador e
+        // o laço só anda pelas linhas.
+        const int i = t % Out;
+        const float d = delta[i];
+        #pragma unroll
+        for (int j = t / Out; j < In; j += threads / Out) {
+            w[j * Stride + i] -= taxa * (d * x[j]);
+        }
+    } else {
+        #pragma unroll 4
+        for (int k = t; k < In * Out; k += threads) {
+            const int j = k / Out;
+            const int i = k % Out;
+            w[j * Stride + i] -= taxa * (delta[i] * x[j]);
         }
     }
-    if (j < Out) {
-        b[j] -= taxa * delta[j];
+    if (t < Out) {
+        b[t] -= taxa * delta[t];
     }
 }
 
@@ -143,7 +167,9 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
 #endif
     for (int epoca = 0; epoca < epocas; ++epoca) {
         for (int k = 0; k < n; ++k) {
-            x[t] = imagens[static_cast<size_t>(k) * entradas + t];
+            if (t < entradas) {
+                x[t] = imagens[static_cast<size_t>(k) * entradas + t];
+            }
             __syncthreads();
             MARCA(0)
 
@@ -175,13 +201,18 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
                 perdas[static_cast<size_t>(epoca) * n + k] = total;
             }
 
-            backward_camada<oculta2, classes, stride3, true>(delta3, a2, w3, b3, z2, delta2, taxa);
+            // Os grad_in das camadas 3 e 2 usam os pesos antigos; os updates
+            // só começam depois. Cada update mexe numa matriz diferente, então
+            // os três podem rodar na mesma fase.
+            gradiente_entrada<oculta2, classes, stride3>(delta3, w3, z2, delta2);
             __syncthreads();
             MARCA(5)
-            backward_camada<oculta1, oculta2, stride2, true>(delta2, a1, w2, b2, z1, delta1, taxa);
+            gradiente_entrada<oculta1, oculta2, stride2>(delta2, w2, z1, delta1);
             __syncthreads();
             MARCA(6)
-            backward_camada<entradas, oculta1, stride1, false>(delta1, x, w1, b1, nullptr, nullptr, taxa);
+            atualizar_pesos<oculta2, classes, stride3>(delta3, a2, w3, b3, taxa);
+            atualizar_pesos<oculta1, oculta2, stride2>(delta2, a1, w2, b2, taxa);
+            atualizar_pesos<entradas, oculta1, stride1>(delta1, x, w1, b1, taxa);
             __syncthreads();
             MARCA(7)
         }
@@ -281,7 +312,7 @@ int main(int argc, char** argv) {
         array<long long, fases> perfil{};
         receber(perfil.data(), d_perfil, fases);
         const char* nomes[fases] = {"carga x", "forward 1", "forward 2", "forward 3",
-                                    "perda", "backward 3", "backward 2", "backward 1"};
+                                    "perda", "grad_in 3", "grad_in 2", "updates"};
         long long total_ciclos = 0;
         for (long long c : perfil) {
             total_ciclos += c;
