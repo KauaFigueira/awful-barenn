@@ -26,9 +26,11 @@ constexpr int classes = 10;
 // todos os laços, desenrola e vetoriza sem testes de resto ou de aliasing.
 template <int In, int Out, bool Final = false>
 class DenseLayer {
-    // Matriz contígua em ordem de linha: weights[i * In + j] liga a entrada j
-    // ao neurônio de saída i. Alinhada a 32 bytes para cargas AVX.
-    alignas(32) array<float, Out * In> weights;
+    // Matriz contígua transposta: weights[j * Out + i] liga a entrada j ao
+    // neurônio de saída i. Cada linha guarda os pesos de uma entrada para
+    // todos os neurônios, então o forward vira AXPY e vetoriza sem reordenar
+    // as somas. Alinhada a 32 bytes para cargas AVX.
+    alignas(32) array<float, In * Out> weights;
     alignas(32) array<float, Out> bias{};
     // Dados do último forward usados para calcular os gradientes.
     const float* last_input = nullptr;
@@ -41,26 +43,35 @@ class DenseLayer {
 public:
     DenseLayer() {
         // A semente fixa torna a inicialização de cada camada reproduzível.
+        // Sorteia na ordem neurônio -> entrada, a mesma do código original.
         mt19937 gen(1337);
         uniform_real_distribution<float> distribution(-0.05f, 0.05f);
-        for (float& weight : weights) {
-            weight = distribution(gen);
+        for (int i = 0; i < Out; ++i) {
+            for (int j = 0; j < In; ++j) {
+                weights[j * Out + i] = distribution(gen);
+            }
         }
     }
 
     // A entrada precisa continuar viva até o Backward correspondente.
     const array<float, Out>& Forward(const float* __restrict x) {
         last_input = x;
-        // Cada neurônio soma o viés aos produtos entre entradas e pesos.
+        // z = bias + soma em j de x[j] * w[j][:], acumulando entrada por entrada.
+        // Cada neurônio soma na mesma ordem do produto escalar original.
+        float* __restrict z = last_z.data();
         for (int i = 0; i < Out; ++i) {
-            const float* __restrict row = &weights[i * In];
-            float sum = bias[i];
-            for (int j = 0; j < In; ++j) {
-                sum += x[j] * row[j];
+            z[i] = bias[i];
+        }
+        for (int j = 0; j < In; ++j) {
+            const float* __restrict row = &weights[j * Out];
+            const float xj = x[j];
+            for (int i = 0; i < Out; ++i) {
+                z[i] += xj * row[i];
             }
-            last_z[i] = sum;
-            // As camadas ocultas usam ReLU. A última devolve escores lineares.
-            out[i] = Final ? sum : max(0.0f, sum);
+        }
+        // As camadas ocultas usam ReLU. A última devolve escores lineares.
+        for (int i = 0; i < Out; ++i) {
+            out[i] = Final ? z[i] : max(0.0f, z[i]);
         }
         return out;
     }
@@ -69,34 +80,34 @@ public:
     template <bool CalcularGradIn = true>
     const array<float, In>& Backward(const float* __restrict grad_out, float learning_rate) {
         const float* __restrict x = last_input;
-        float* __restrict gin = grad_in.data();
+        float* __restrict d = delta.data();
         // Delta é o gradiente da perda em relação à soma antes da ativação.
         // Na ReLU, o gradiente passa apenas quando essa soma é positiva.
         for (int i = 0; i < Out; ++i) {
-            delta[i] = Final ? grad_out[i]
-                             : grad_out[i] * (last_z[i] > 0.0f ? 1.0f : 0.0f);
+            d[i] = Final ? grad_out[i]
+                         : grad_out[i] * (last_z[i] > 0.0f ? 1.0f : 0.0f);
         }
 
-        // Uma única passada por linha: primeiro acumula a contribuição da linha
-        // no gradiente da entrada (com o peso antigo), depois aplica o SGD.
-        // grad_in[j] = soma em i de delta[i] * w[i][j], na mesma ordem do legado.
-        if constexpr (CalcularGradIn) {
-            grad_in.fill(0.0f);
-        }
-        for (int i = 0; i < Out; ++i) {
-            float* __restrict row = &weights[i * In];
-            const float d = delta[i];
+        // Uma única passada por linha (entrada j): primeiro calcula grad_in[j]
+        // com os pesos antigos, depois aplica o SGD na linha.
+        for (int j = 0; j < In; ++j) {
+            float* __restrict row = &weights[j * Out];
             if constexpr (CalcularGradIn) {
-                for (int j = 0; j < In; ++j) {
-                    gin[j] += d * row[j];
+                float sum = 0;
+                for (int i = 0; i < Out; ++i) {
+                    sum += d[i] * row[i];
                 }
+                grad_in[j] = sum;
             }
             // SGD por amostra. O gradiente do peso é delta vezes a entrada.
-            // O gradiente do viés é o próprio delta.
-            for (int j = 0; j < In; ++j) {
-                row[j] -= learning_rate * (d * x[j]);
+            const float xj = x[j];
+            for (int i = 0; i < Out; ++i) {
+                row[i] -= learning_rate * (d[i] * xj);
             }
-            bias[i] -= learning_rate * d;
+        }
+        // O gradiente do viés é o próprio delta.
+        for (int i = 0; i < Out; ++i) {
+            bias[i] -= learning_rate * d[i];
         }
         return grad_in;
     }
