@@ -1,3 +1,84 @@
+# Barenn: CPU otimizada e CUDA
+
+Relatório da APS2 de Supercomputação. Cada degrau de desempenho é um bloco lógico: **issue** (diagnóstico, hipótese e métrica base) → **branch** → **PR** → **tag anotada**. Os comentários de fechamento de cada issue trazem os dados de profiling e a discussão.
+
+## Resultado consolidado
+
+Tempo de **treino** (51 épocas, `optdigits.tra`), medido com `scripts/bench.sh` (média de 10 execuções, 5 nas versões mais lentas de GPU). As colunas do Franky usam o mesmo nó para CPU e GPU (`compute20`–`23`: i9-14900 + RTX A1000). **Todas as versões produzem saída impressa idêntica à do código legado** (`scripts/validate.sh`): mesmas perdas por época, 1717/1797 acertos (95,5 %) e mesma matriz de confusão.
+
+| Etapa | Tag | Franky: treino | Speedup vs legado | Notebook (i7-10750H) | Issue |
+|---|---|---:|---:|---:|---|
+| **Baseline legado** (`-O2`) | [`v0.0-baseline`](https://github.com/KauaFigueira/awful-barenn/tree/v0.0-baseline) | 0,431 s | 1,00× | 1,771 s | [#1](https://github.com/KauaFigueira/awful-barenn/issues/1) |
+| sem cópias / sem `grad_in` inútil | [`v0.1-sem-copias`](https://github.com/KauaFigueira/awful-barenn/tree/v0.1-sem-copias) | 0,315 s | 1,37× | 1,171 s | [#3](https://github.com/KauaFigueira/awful-barenn/issues/3) |
+| pesos contíguos + backward fundido | [`v0.2-layout-contiguo`](https://github.com/KauaFigueira/awful-barenn/tree/v0.2-layout-contiguo) | 0,347 s | 1,24× | 1,115 s | [#5](https://github.com/KauaFigueira/awful-barenn/issues/5) |
+| `-O3 -march` + camadas em template | [`v0.3-simd-template`](https://github.com/KauaFigueira/awful-barenn/tree/v0.3-simd-template) | 0,134 s | 3,22× | 0,526 s | [#7](https://github.com/KauaFigueira/awful-barenn/issues/7) |
+| pesos transpostos (forward AXPY) | [`v0.4-forward-axpy`](https://github.com/KauaFigueira/awful-barenn/tree/v0.4-forward-axpy) | 0,110 s | 3,92× | 0,361 s | [#9](https://github.com/KauaFigueira/awful-barenn/issues/9) |
+| **CPU otimizada** (+ OpenMP no parsing) | [`v0.5-openmp`](https://github.com/KauaFigueira/awful-barenn/tree/v0.5-openmp) | **0,111 s** (total 0,115 s) | **3,88×** | 0,361 s (total 0,376 s) | [#11](https://github.com/KauaFigueira/awful-barenn/issues/11) |
+| **CUDA inicial** (kernel por camada, cópia por amostra) | [`v1.0-cuda-inicial`](https://github.com/KauaFigueira/awful-barenn/tree/v1.0-cuda-inicial) | 5,681 s | 0,08× | – | [#13](https://github.com/KauaFigueira/awful-barenn/issues/13) |
+| dados residentes + perda na GPU | [`v1.1-cuda-residente`](https://github.com/KauaFigueira/awful-barenn/tree/v1.1-cuda-residente) | 3,671 s | 0,12× | – | [#15](https://github.com/KauaFigueira/awful-barenn/issues/15) |
+| kernel persistente + shared memory | [`v1.2-cuda-persistente`](https://github.com/KauaFigueira/awful-barenn/tree/v1.2-cuda-persistente) | 0,795 s | 0,54× | – | [#17](https://github.com/KauaFigueira/awful-barenn/issues/17) |
+| padding (sem conflito de banco) | [`v1.3-cuda-padding`](https://github.com/KauaFigueira/awful-barenn/tree/v1.3-cuda-padding) | 0,389 s | 1,11× | – | [#19](https://github.com/KauaFigueira/awful-barenn/issues/19) |
+| update distribuído em 256 threads | [`v1.4-cuda-update-paralelo`](https://github.com/KauaFigueira/awful-barenn/tree/v1.4-cuda-update-paralelo) | 0,328 s | 1,31× | – | [#21](https://github.com/KauaFigueira/awful-barenn/issues/21) |
+| **CUDA otimizado** (prefetch, 6 barreiras/amostra) | [`v1.5-cuda-prefetch`](https://github.com/KauaFigueira/awful-barenn/tree/v1.5-cuda-prefetch) | **0,298 s** | **1,45×** | – | [#23](https://github.com/KauaFigueira/awful-barenn/issues/23) |
+| vários modelos por lançamento | [`v1.6-cuda-multimodelo`](https://github.com/KauaFigueira/awful-barenn/tree/v1.6-cuda-multimodelo) | 0,295 s (1 modelo) | 1,46× | – | [#25](https://github.com/KauaFigueira/awful-barenn/issues/25) |
+
+**Throughput com vários modelos** (`scripts/escala.sh`, [#25](https://github.com/KauaFigueira/awful-barenn/issues/25)): 18 modelos treinam na GPU em 0,298 s, o mesmo tempo de 1. Com 576 modelos, a GPU leva **5,04 s** e a CPU (8 núcleos) **12,49 s**: **2,5×** mais modelos por segundo.
+
+### Leitura rápida dos resultados
+
+- **CPU:** 3,9× (Franky) e 4,9× (notebook) sobre o legado. Os ganhos vieram de tirar alocações e trabalho inútil, deixar os pesos contíguos e vetorizar o forward **sem reordenar somas**, o que mantém a saída idêntica. O treino é serial por natureza (SGD por amostra), então o OpenMP só ajuda no parsing. O speedup medido no programa inteiro (1,12× com 4 threads) bate com a Lei de Amdahl ([#11](https://github.com/KauaFigueira/awful-barenn/issues/11)).
+- **GPU, um modelo:** o port direto é 51× mais lento que a CPU. O problema é latência (584 k `cudaMemcpy` síncronos, 1,2 M lançamentos), não banda nem FLOPs. Dados residentes, um kernel persistente, padding na shared memory, mais warps e prefetch levaram de 5,68 s a 0,298 s (**19×**), mas a cadeia serial de 194 973 passos com ≤ 64 operações por fase não enche a GPU (1 de 18 SMs). A CPU continua 2,7× mais rápida para um treino.
+- **GPU, vários modelos:** com problema maior (Gustafson), os SMs ociosos passam a trabalhar e a GPU vence em throughput.
+- **Profiling:** callgrind, cachegrind e `perf` (CPU); Nsight Systems, `ptxas -v` e instrumentação com `clock64()` por fase (GPU). O Nsight Compute está bloqueado no cluster para usuários comuns (`ERR_NVGPUCTRPERM`), o que está documentado em [#13](https://github.com/KauaFigueira/awful-barenn/issues/13).
+
+## Índice
+
+| Bloco | Issue | PR | Tag |
+|---|---|---|---|
+| Baseline reproduzível e gargalos | [#1](https://github.com/KauaFigueira/awful-barenn/issues/1) | [#2](https://github.com/KauaFigueira/awful-barenn/pull/2) | [`v0.0-baseline`](https://github.com/KauaFigueira/awful-barenn/tree/v0.0-baseline) |
+| Remover cópias, alocações e cálculo inútil | [#3](https://github.com/KauaFigueira/awful-barenn/issues/3) | [#4](https://github.com/KauaFigueira/awful-barenn/pull/4) | [`v0.1-sem-copias`](https://github.com/KauaFigueira/awful-barenn/tree/v0.1-sem-copias) |
+| Layout contíguo e backward em uma passada | [#5](https://github.com/KauaFigueira/awful-barenn/issues/5) | [#6](https://github.com/KauaFigueira/awful-barenn/pull/6) | [`v0.2-layout-contiguo`](https://github.com/KauaFigueira/awful-barenn/tree/v0.2-layout-contiguo) |
+| Flags de vetorização e templates | [#7](https://github.com/KauaFigueira/awful-barenn/issues/7) | [#8](https://github.com/KauaFigueira/awful-barenn/pull/8) | [`v0.3-simd-template`](https://github.com/KauaFigueira/awful-barenn/tree/v0.3-simd-template) |
+| Pesos transpostos (forward sem redução) | [#9](https://github.com/KauaFigueira/awful-barenn/issues/9) | [#10](https://github.com/KauaFigueira/awful-barenn/pull/10) | [`v0.4-forward-axpy`](https://github.com/KauaFigueira/awful-barenn/tree/v0.4-forward-axpy) |
+| OpenMP e limite de Amdahl | [#11](https://github.com/KauaFigueira/awful-barenn/issues/11) | [#12](https://github.com/KauaFigueira/awful-barenn/pull/12) | [`v0.5-openmp`](https://github.com/KauaFigueira/awful-barenn/tree/v0.5-openmp) |
+| Port inicial para CUDA | [#13](https://github.com/KauaFigueira/awful-barenn/issues/13) | [#14](https://github.com/KauaFigueira/awful-barenn/pull/14) | [`v1.0-cuda-inicial`](https://github.com/KauaFigueira/awful-barenn/tree/v1.0-cuda-inicial) |
+| Dados residentes e perda na GPU | [#15](https://github.com/KauaFigueira/awful-barenn/issues/15) | [#16](https://github.com/KauaFigueira/awful-barenn/pull/16) | [`v1.1-cuda-residente`](https://github.com/KauaFigueira/awful-barenn/tree/v1.1-cuda-residente) |
+| Kernel persistente com shared memory | [#17](https://github.com/KauaFigueira/awful-barenn/issues/17) | [#18](https://github.com/KauaFigueira/awful-barenn/pull/18) | [`v1.2-cuda-persistente`](https://github.com/KauaFigueira/awful-barenn/tree/v1.2-cuda-persistente) |
+| Padding contra conflito de banco | [#19](https://github.com/KauaFigueira/awful-barenn/issues/19) | [#20](https://github.com/KauaFigueira/awful-barenn/pull/20) | [`v1.3-cuda-padding`](https://github.com/KauaFigueira/awful-barenn/tree/v1.3-cuda-padding) |
+| Mais warps no update | [#21](https://github.com/KauaFigueira/awful-barenn/issues/21) | [#22](https://github.com/KauaFigueira/awful-barenn/pull/22) | [`v1.4-cuda-update-paralelo`](https://github.com/KauaFigueira/awful-barenn/tree/v1.4-cuda-update-paralelo) |
+| Prefetch e menos barreiras | [#23](https://github.com/KauaFigueira/awful-barenn/issues/23) | [#24](https://github.com/KauaFigueira/awful-barenn/pull/24) | [`v1.5-cuda-prefetch`](https://github.com/KauaFigueira/awful-barenn/tree/v1.5-cuda-prefetch) |
+| Vários modelos (escalabilidade fraca) | [#25](https://github.com/KauaFigueira/awful-barenn/issues/25) | [#26](https://github.com/KauaFigueira/awful-barenn/pull/26) | [`v1.6-cuda-multimodelo`](https://github.com/KauaFigueira/awful-barenn/tree/v1.6-cuda-multimodelo) |
+
+## Como reproduzir
+
+CPU (qualquer máquina com g++ ≥ 11):
+
+```bash
+git checkout <tag>
+make && make validate && make bench
+scripts/bench.sh ./barenn 10 total   # outras etapas: leitura, avaliacao
+```
+
+GPU (no head-node do Cluster Franky; os nós de GPU não têm headers do sistema, então o script compila no head-node e roda via `srun` em `sunny_gpu`):
+
+```bash
+git checkout <tag>   # v1.0 em diante
+scripts/franky.sh './scripts/validate.sh ./barenn_cuda; ./scripts/bench.sh ./barenn_cuda 10'
+scripts/franky.sh 'make perfil >/dev/null; ./barenn_cuda_perfil > /dev/null'   # ciclos por fase (v1.2+)
+scripts/franky.sh './scripts/escala.sh "1 18 72 576"'                         # v1.6
+```
+
+| Ambiente | CPU | GPU | Compilador |
+|---|---|---|---|
+| Notebook | i7-10750H (6C/12T), 31 GB | – | g++ 11.4, Ubuntu 22.04 |
+| Franky `compute20`–`23` | i9-14900 (8 núcleos via SLURM), 62 GB | RTX A1000 8 GB (sm_86, 18 SMs, PCIe x8) | g++ 14.2, CUDA 12.8 |
+
+Flags finais: CPU `-std=c++17 -O3 -march=native -ffp-contract=off -fopenmp`; GPU `-O3 -arch=sm_86 --fmad=false`. Desliguei a contração em FMA de propósito, para manter a saída idêntica ao legado (ver [#7](https://github.com/KauaFigueira/awful-barenn/issues/7)).
+
+---
+
+# Enunciado original
+
 # Projeto Barenn: O Legado, a Sobrevivência e o Salto para a GPU
 
 Era uma segunda-feira aparentemente tranquila quando a demanda chegou à sua mesa. A liderança técnica se aproximou com um sorriso contido e soltou aquela frase clássica que faz qualquer engenheiro gelar por dentro:
