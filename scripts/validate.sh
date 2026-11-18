@@ -14,7 +14,7 @@ trap 'rm -f "$OUT"' EXIT
 "$BIN" > "$OUT"
 
 if diff <(grep -v 'Tempo de treino' "$REF") <(grep -v 'Tempo de treino' "$OUT") > /dev/null; then
-    echo "OK: saida identica a referencia (bit a bit)"
+    echo "OK: saida impressa identica a referencia"
     exit 0
 fi
 
