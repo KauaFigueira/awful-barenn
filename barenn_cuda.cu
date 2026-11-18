@@ -139,11 +139,17 @@ struct Parametros {
     float* w3; float* b3;
 };
 
-// Treino inteiro em um único lançamento de 1 bloco. Toda a rede fica na
-// shared memory; as fases de cada amostra são separadas por __syncthreads().
-__global__ void __launch_bounds__(threads, 1)
+constexpr int tamanho_w1 = entradas * oculta1;
+constexpr int tamanho_w2 = oculta1 * oculta2;
+constexpr int tamanho_w3 = oculta2 * classes;
+
+// Treino inteiro em um único lançamento. Cada bloco treina um modelo
+// independente (bloco m usa taxas[m] e o m-ésimo conjunto de parâmetros);
+// toda a rede do bloco fica na shared memory e as fases de cada amostra são
+// separadas por __syncthreads().
+__global__ void __launch_bounds__(threads)
 treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
-               int epocas, float taxa, float* perdas, long long* perfil) {
+               int epocas, const float* taxas, float* perdas, long long* perfil) {
     __shared__ float w1[entradas * stride1], b1[oculta1];
     __shared__ float w2[oculta1 * stride2], b2[oculta2];
     __shared__ float w3[oculta2 * stride3], b3[classes];
@@ -156,12 +162,22 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
     __shared__ float termos[classes];
 
     const int t = threadIdx.x;
-    copiar_pesos<entradas, oculta1, stride1, true>(p.w1, w1);
-    copiar_pesos<oculta1, oculta2, stride2, true>(p.w2, w2);
-    copiar_pesos<oculta2, classes, stride3, true>(p.w3, w3);
-    if (t < oculta1) b1[t] = p.b1[t];
-    if (t < oculta2) b2[t] = p.b2[t];
-    if (t < classes) b3[t] = p.b3[t];
+    const int m = blockIdx.x;
+    const float taxa = taxas[m];
+    float* gw1 = p.w1 + m * tamanho_w1;
+    float* gw2 = p.w2 + m * tamanho_w2;
+    float* gw3 = p.w3 + m * tamanho_w3;
+    float* gb1 = p.b1 + m * oculta1;
+    float* gb2 = p.b2 + m * oculta2;
+    float* gb3 = p.b3 + m * classes;
+    perdas += static_cast<size_t>(m) * epocas * n;
+
+    copiar_pesos<entradas, oculta1, stride1, true>(gw1, w1);
+    copiar_pesos<oculta1, oculta2, stride2, true>(gw2, w2);
+    copiar_pesos<oculta2, classes, stride3, true>(gw3, w3);
+    if (t < oculta1) b1[t] = gb1[t];
+    if (t < oculta2) b2[t] = gb2[t];
+    if (t < classes) b3[t] = gb3[t];
     if (t < entradas) x[0][t] = imagens[t];
     // Rótulo da amostra atual, mantido em registrador pelos threads da perda.
     int rotulo = rotulos[0];
@@ -233,18 +249,18 @@ treinar_kernel(Parametros p, const float* imagens, const int* rotulos, int n,
     }
 
 #ifdef BARENN_PERFIL
-    if (t == 0) {
+    if (t == 0 && m == 0) {
         for (int f = 0; f < fases; ++f) {
             perfil[f] = ciclos[f];
         }
     }
 #endif
-    copiar_pesos<entradas, oculta1, stride1, false>(p.w1, w1);
-    copiar_pesos<oculta1, oculta2, stride2, false>(p.w2, w2);
-    copiar_pesos<oculta2, classes, stride3, false>(p.w3, w3);
-    if (t < oculta1) p.b1[t] = b1[t];
-    if (t < oculta2) p.b2[t] = b2[t];
-    if (t < classes) p.b3[t] = b3[t];
+    copiar_pesos<entradas, oculta1, stride1, false>(gw1, w1);
+    copiar_pesos<oculta1, oculta2, stride2, false>(gw2, w2);
+    copiar_pesos<oculta2, classes, stride3, false>(gw3, w3);
+    if (t < oculta1) gb1[t] = b1[t];
+    if (t < oculta2) gb2[t] = b2[t];
+    if (t < classes) gb3[t] = b3[t];
 }
 
 // Reserva um vetor na GPU e copia o conteúdo do host.
@@ -259,6 +275,49 @@ T* enviar(const T* dados, size_t n) {
 template <typename T>
 void receber(T* destino, const T* ptr, size_t n) {
     CUDA_CHECK(cudaMemcpy(destino, ptr, sizeof(T) * n, cudaMemcpyDeviceToHost));
+}
+
+// Repete os parâmetros iniciais para cada modelo.
+vector<float> replicar(const float* dados, size_t n, int modelos) {
+    vector<float> v(n * modelos);
+    for (int m = 0; m < modelos; ++m) {
+        copy(dados, dados + n, v.begin() + m * n);
+    }
+    return v;
+}
+
+// Número de modelos treinados ao mesmo tempo (variável BARENN_MODELOS).
+// O modelo 0 usa a taxa original e produz a saída padrão; os demais varrem
+// taxas de taxa/4 a 4·taxa em escala logarítmica.
+int ler_modelos() {
+    const char* valor = getenv("BARENN_MODELOS");
+    const int modelos = valor ? atoi(valor) : 1;
+    if (modelos < 1 || modelos > 4096) {
+        throw runtime_error("BARENN_MODELOS deve estar entre 1 e 4096");
+    }
+    return modelos;
+}
+
+vector<float> criar_taxas(int modelos) {
+    vector<float> taxas(modelos, Barenn::taxa);
+    for (int m = 1; m < modelos; ++m) {
+        const double expoente = modelos > 2 ? -2.0 + 4.0 * (m - 1) / (modelos - 2) : 1.0;
+        taxas[m] = static_cast<float>(Barenn::taxa * pow(2.0, expoente));
+    }
+    return taxas;
+}
+
+// Acertos no conjunto de teste, usando o forward da CPU.
+size_t contar_acertos(Barenn::Camada1& l1, Barenn::Camada2& l2, Barenn::Camada3& l3,
+                      const vector<Barenn::Amostra>& teste) {
+    size_t acertos = 0;
+    for (const auto& amostra : teste) {
+        const auto& escores = l3.Forward(l2.Forward(l1.Forward(amostra.imagem.data()).data()).data());
+        const int previsto = static_cast<int>(
+            max_element(escores.begin(), escores.end()) - escores.begin());
+        acertos += previsto == amostra.rotulo;
+    }
+    return acertos;
 }
 
 } // namespace BarennGPU
@@ -291,10 +350,18 @@ int main(int argc, char** argv) {
 
         // Inicializa o contexto CUDA fora da medição do treino.
         CUDA_CHECK(cudaFree(nullptr));
+        const int modelos = ler_modelos();
+        const vector<float> taxas = criar_taxas(modelos);
+        // Todos os modelos partem dos mesmos pesos iniciais.
+        auto enviar_todos = [&](const float* dados, size_t tamanho) {
+            const vector<float> v = replicar(dados, tamanho, modelos);
+            return enviar(v.data(), v.size());
+        };
         Parametros p{
-            enviar(l1->pesos(), entradas * oculta1), enviar(l1->vies(), oculta1),
-            enviar(l2->pesos(), oculta1 * oculta2), enviar(l2->vies(), oculta2),
-            enviar(l3->pesos(), oculta2 * classes), enviar(l3->vies(), classes)};
+            enviar_todos(l1->pesos(), tamanho_w1), enviar_todos(l1->vies(), oculta1),
+            enviar_todos(l2->pesos(), tamanho_w2), enviar_todos(l2->vies(), oculta2),
+            enviar_todos(l3->pesos(), tamanho_w3), enviar_todos(l3->vies(), classes)};
+        float* d_taxas = enviar(taxas.data(), taxas.size());
 
         // Conjunto de treino inteiro na GPU, copiado uma única vez.
         const int n = static_cast<int>(treino.size());
@@ -308,15 +375,15 @@ int main(int argc, char** argv) {
         float* d_imagens = enviar(imagens.data(), imagens.size());
         int* d_rotulos = enviar(rotulos.data(), rotulos.size());
         float* d_perdas;
-        CUDA_CHECK(cudaMalloc(&d_perdas, sizeof(float) * epocas * n));
+        CUDA_CHECK(cudaMalloc(&d_perdas, sizeof(float) * modelos * epocas * n));
         long long* d_perfil;
         CUDA_CHECK(cudaMalloc(&d_perfil, sizeof(long long) * fases));
         CUDA_CHECK(cudaMemset(d_perfil, 0, sizeof(long long) * fases));
 
-        // Um único lançamento treina todas as épocas.
+        // Um único lançamento treina todas as épocas de todos os modelos.
         const auto inicio = chrono::steady_clock::now();
-        treinar_kernel<<<1, threads>>>(p, d_imagens, d_rotulos, n, epocas,
-                                       Barenn::taxa, d_perdas, d_perfil);
+        treinar_kernel<<<modelos, threads>>>(p, d_imagens, d_rotulos, n, epocas,
+                                             d_taxas, d_perdas, d_perfil);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         const chrono::duration<double> tempo = chrono::steady_clock::now() - inicio;
@@ -355,14 +422,44 @@ int main(int argc, char** argv) {
             perdas[epoca] = perda_total / n;
         }
 
-        // Traz os pesos treinados de volta e avalia com o código da CPU.
-        receber(l1->pesos(), p.w1, entradas * oculta1);
+        // Com vários modelos, resume cada um no stderr (a saída padrão continua
+        // sendo a do modelo 0).
+        if (modelos > 1) {
+            auto m1 = make_unique<Barenn::Camada1>();
+            auto m2 = make_unique<Barenn::Camada2>();
+            auto m3 = make_unique<Barenn::Camada3>();
+            vector<float> ultima(n);
+            cerr << fixed << "MODELOS " << modelos << " | treino " << setprecision(4)
+                 << tempo.count() << " s\n";
+            for (int m = 0; m < modelos; ++m) {
+                receber(m1->pesos(), p.w1 + m * tamanho_w1, tamanho_w1);
+                receber(m1->vies(), p.b1 + m * oculta1, oculta1);
+                receber(m2->pesos(), p.w2 + m * tamanho_w2, tamanho_w2);
+                receber(m2->vies(), p.b2 + m * oculta2, oculta2);
+                receber(m3->pesos(), p.w3 + m * tamanho_w3, tamanho_w3);
+                receber(m3->vies(), p.b3 + m * classes, classes);
+                receber(ultima.data(),
+                        d_perdas + (static_cast<size_t>(m) * epocas + epocas - 1) * n, n);
+                double perda_final = 0;
+                for (float v : ultima) {
+                    perda_final += v;
+                }
+                const size_t acertos = contar_acertos(*m1, *m2, *m3, teste);
+                cerr << "modelo " << setw(4) << m << " taxa " << setprecision(5) << taxas[m]
+                     << " perda final " << setprecision(4) << perda_final / n
+                     << " acuracia " << setprecision(1) << 100.0 * acertos / teste.size()
+                     << "%\n";
+            }
+        }
+
+        // Traz os pesos treinados do modelo 0 e avalia com o código da CPU.
+        receber(l1->pesos(), p.w1, tamanho_w1);
         receber(l1->vies(), p.b1, oculta1);
-        receber(l2->pesos(), p.w2, oculta1 * oculta2);
+        receber(l2->pesos(), p.w2, tamanho_w2);
         receber(l2->vies(), p.b2, oculta2);
-        receber(l3->pesos(), p.w3, oculta2 * classes);
+        receber(l3->pesos(), p.w3, tamanho_w3);
         receber(l3->vies(), p.b3, classes);
-        for (float* ptr : {p.w1, p.b1, p.w2, p.b2, p.w3, p.b3, d_imagens, d_perdas}) {
+        for (float* ptr : {p.w1, p.b1, p.w2, p.b2, p.w3, p.b3, d_imagens, d_perdas, d_taxas}) {
             cudaFree(ptr);
         }
         cudaFree(d_rotulos);
